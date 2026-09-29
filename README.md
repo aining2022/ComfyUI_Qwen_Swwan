@@ -52,7 +52,7 @@
 | 节点 | 用途 |
 | --- | --- |
 | **PE Rewrite T8** | 改写提示词，输出文字、`PE_RESULT` 和诊断 JSON。 |
-| **PE Canvas T8** | 根据模型比例或参考图尺寸生成宽、高和 Qwen Image 2.1 空 latent。 |
+| **PE Canvas T8** | 图片编辑跟随固定参考图尺寸；文生图根据比例生成宽、高和 Qwen Image 2.1 空 latent。 |
 | **PE Unload T8** | 显式卸载由本节点启动、处于 `keep_loaded` 模式的模型。 |
 | **PE Local Models T8** | 列出本机发现的 GGUF 主模型和视觉组件。 |
 
@@ -60,12 +60,30 @@
 
 - `task`：`auto` 根据**实际有图**的输入选择文生图或编辑；`t2i` 只接受文字；`edit` 至少需要一张图。
 - `t2i_model` / `edit_model`：分别用于文生图与编辑。可在 `edit_model` 中选择 `pe_i2i_heretic-Q4_K_M.gguf`；其配套视觉组件会在 `vision_model=Auto` 时自动匹配。
-- `aspect_ratio`：`auto` 或 `1:1`、`1:2`、`2:3`、`3:4`、`4:5`、`16:9`、`9:16`、`21:9`、`9:21`、`5:4`、`4:3`、`2:1`。指定比例会覆盖模型建议，并传给 PE Canvas。
-- `output_language`：`auto`、`中文`、`English`。指定语言时，节点会检查改写结果；必要时使用当前本地模型翻译，图内明确要求的引号文字保持原样。
+- `aspect_ratio`：仅文生图生效，`auto` 使用模型建议，指定值覆盖模型比例。图片编辑始终沿用 `canvas_image` 所选参考图比例。
+- `output_language`：`auto`、`中文` 或 `English`，指导改写描述的语言；图中文字单独保留原文。编辑不会仅因图中文字或专有名词再调用模型翻译。
 - `transparent_rgba`：在最终提示词中加入 RGBA、alpha 通道和透明背景要求。**它控制提示词，不保证下游生成的图片一定带 alpha 通道。**
 - `model_lifetime`：`after_run` 在每次完成或报错后卸载；`keep_loaded` 便于连续调用，之后可接 **PE Unload T8**。
+- `reasoning`：`auto` 对图片编辑和 Bonsai 2 默认关闭思考；`off` / `on` 可显式选择。追求速度时保持 `auto` 或 `off`。
+- `system_prompt`：可选外接 STRING，连接 **Primitive String Multiline** 等文本节点；非空替换默认模板，空文本使用默认模板。编辑采用精简纯文本模板，节点追加纯文本输出和图片编号规则；粘贴完整 ChatML 模板时自动只取 system 正文。诊断输出记录来源及 SHA256。
+- `edit_max_tokens`：图片编辑最大生成 token 数，默认 `1536`，可设置 `1–65536`，也可转换为输入外接。仅控制上限，不强制输出长度；启用思考时也计入此预算。截断重试保持相同上限，实际输出还受模型上下文剩余空间限制。详略由外接 `system_prompt` 控制，节点不再追加简短要求。旧工作流缺少此参数时使用默认值，文生图行为保持。
+- `canvas_image`：编辑画布参考图编号，默认 `1`；多图可选 `2` 等，按实际有图的输入顺序编号。节点固定跟随该图，不让模型推测比例。只接改写文字时，下游画布仍由原工作流控制。
 
 `image_1` 至 `image_10` 每个端口只接一张 IMAGE，不接受批次。输出为 `None` 的端口会跳过，剩余图片按端口顺序连续编号。例如 `image_1` 有图、`image_2` 为 `None`、`image_9` 有图时，前一张是 `<image1>`，后一张是 `<image2>`；`PE_RESULT.image_input_ports` 记录它们原本来自哪些端口。单图编辑可自然描述或使用 `<image1>`；多图编辑的改写结果必须包含全部 `<image1>` 至 `<imageN>`。连接下游 `TextEncodeQwenImage21` 时，务必给它同一批图片、同一顺序。
+
+### 使用 Bonsai 2 27B
+
+本节点也支持 `Ternary-Bonsai-2-27B-PTQ1_0.gguf` / `PQ2_0`，图像编辑时配套使用 `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`。将文件放入上述模型目录，并在 `t2i_model` / `edit_model` 中选择 Bonsai；`vision_model` 可自动匹配，也可显式选择同系列的视觉组件。
+
+也支持 [OS-Software 的 Heretic PQ2](https://huggingface.co/OS-Software/Ternary-Bonsai-2-27B-Uncensored-Heretic-GGUF) 文件 `Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf`，下方两个 Bonsai 工作流已选择该模型。它可以继续使用原版 `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`，也可显式选择来源仓库的 `mmproj-Q8_0.gguf`；跨文件名前缀配对会校验已知的 Q8 SHA256，并按文件状态缓存结果。`Auto` 使用同目录中带 Heretic 模型前缀的视觉文件。
+
+Bonsai 2 必须使用 [PrismML 的 llama.cpp](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/BACKEND-SUPPORT.md)。Linux 可通过 `QWEN_PE_LLAMA_SERVER` 指定运行时，或在节点 `runtime/` 下放置原生 `llama-server`；需保留其配套动态库。节点启动的 Linux 子进程会优先加载该可执行文件目录中的库，避免 Conda 内另一套 llama.cpp 覆盖它。建议使用 `model_lifetime=after_run`，在提示词改写后释放显存。
+
+提示词增强通常需要处理较长的系统提示词和图片输入。[官方模型卡](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf#choosing-a-packing)说明 `PQ2_0` 的输入处理更快；`PTQ1_0` 在 Ada GPU 的文本生成更快。本示例选择 `PQ2_0`、`reasoning=off`、`model_lifetime=after_run`。
+
+[双图编辑工作流](workflows/Qwen-PE-2.1-Bonsai-Edit-2-Images.json) 包含 Bonsai 改写、Qwen Image 2.1 编码、采样与保存。示例的两张图片来自验证服务器现有输入，使用前可在两个 `LoadImage` 节点中替换。
+
+[外接系统提示词版本](workflows/Qwen-PE-2.1-Bonsai-Edit-2-Images-External-System-Prompt.json) 预先连接一个内置 `PrimitiveStringMultiline` 文本节点，初始内容为精简编辑模板，可直接修改。双图示例固定 `canvas_image=2`，沿用场景图比例。
 
 ## 示例工作流
 
@@ -85,14 +103,15 @@
 
 | 现象 | 检查方法 |
 | --- | --- |
+| 加载后提示 `reasoning` 输入值 `1` 不可用 | 更新插件并刷新浏览器。前端兼容处理按实际控件名称恢复参数，避免 seed 控制控件导致错位；旧工作流缺少思考选项或已保存成画布编号时恢复为 `auto`，图片编辑默认关闭思考。 |
 | 模型列表为空或提示找不到 GGUF | 确认模型文件名和目录；可用 **PE Local Models T8** 查看扫描结果。 |
 | 编辑模式提示缺少 mmproj | 确认 I2I 主模型和视觉文件同目录，或在 `vision_model` 中选择匹配文件。 |
-| `model response reached the generation or context limit` | 节点会关闭思考重试一次；仍失败时查看错误中的 token 用量，减少输入图片或缩短原始要求。多图模式会占用更多显存。 |
-| `model failed format validation` | 模型两次都未返回合规的 JSON、比例、语言或图片编号；查看报错详情。成功运行时可用 `diagnostics` 核对任务及图片端口映射。 |
+| `model response reached the generation or context limit` | 节点会在相同 token 上限内关闭思考重试一次；编辑仍失败时可调高 `edit_max_tokens`，或根据错误中的上下文用量减少输入图片／文本。多图模式会占用更多显存。 |
+| `model failed format validation` | 模型两次都未返回有效编辑指令及图片编号，或文生图 JSON、比例、语言未通过校验；查看报错详情。成功运行时可用 `diagnostics` 核对任务及图片端口映射。 |
 | 找不到 `TextEncodeQwenImage21` | 更新到支持 Qwen Image 2.1 的 ComfyUI；纯改写示例不需要该节点。 |
 | 透明图最终仍是不透明 PNG | 检查下游图像模型、VAE 和保存流程；PE 节点只生成透明图提示词。 |
 
-本地 `llama-server` 只监听 `127.0.0.1`。输入图会缩小为最多约 100 万像素、最长边 4096 像素的视觉副本；PE Canvas 仍使用原图尺寸。模型返回内容经过 JSON、图片引用、语言及模式校验，失败时会重试一次并报告原因。
+本地 `llama-server` 只监听 `127.0.0.1`。输入图会缩小为最多约 100 万像素、最长边 4096 像素的视觉副本；PE Canvas 仍使用原图尺寸。编辑模式接收一段纯文本，兼容旧 JSON 的 `rewritten_prompt` 字段并忽略模型的比例字段；比例由 `canvas_image` 固定，`aspect_ratio` 在编辑中不生效。编辑默认不思考，不因图中文字或专有名词额外翻译；仍检查非空内容、完整输出、图片编号及透明模式，失败最多重试一次。文生图保留原 JSON、语言及比例校验。
 
 ## 可选：Viggle Turbo 4 步 LoRA
 

@@ -1,5 +1,7 @@
 import atexit
 import base64
+from functools import lru_cache
+import hashlib
 import io
 import json
 import math
@@ -23,8 +25,13 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_T2I = "Qwen-Image-2.1-PE-T2I.Q4_K_M.gguf"
 DEFAULT_EDIT = "Qwen-Image-2.1-PE-I2I.Q4_K_M.gguf"
 DEFAULT_MMPROJ = "Qwen-Image-2.1-PE-I2I.mmproj-bf16.gguf"
+DEFAULT_EDIT_MAX_TOKENS = 1536
+MAX_EDIT_TOKENS = 65536
 MAX_VISUAL_PIXELS = 1024 * 1024
 MAX_VISUAL_SIDE = 4096
+# OS-Software Heretic revision 5ab50fd49410941a8d4f97912303b1c7d458ffa2
+# ships the same Q8 projector as the original Bonsai 2 model.
+_SHARED_BONSAI_VISION_SHA256 = "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903"
 _RATIO = re.compile(r"^[1-9]\d{0,2}:[1-9]\d{0,2}$")
 _HAN = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 _OTHER_SCRIPT = re.compile(r"[\u0400-\u052f\u0590-\u06ff\u0900-\u097f\u0e00-\u0e7f\u3040-\u30ff\uac00-\ud7af]")
@@ -32,6 +39,12 @@ _QUOTED_LITERAL = re.compile(
     r'"[^"\n]*"|“[^”\n]*”|‘[^’\n]*’|「[^」\n]*」|『[^』\n]*』|«[^»\n]*»|'
     r"(?<![A-Za-z0-9])'(?:[^'\n]|(?<=[A-Za-z0-9])'(?=[A-Za-z0-9]))*'(?![A-Za-z0-9])"
 )
+
+
+def validate_edit_max_tokens(value):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_EDIT_TOKENS:
+        raise ValueError(f"edit_max_tokens must be an integer between 1 and {MAX_EDIT_TOKENS}")
+    return value
 
 
 def _protected_quote(match, protected_literals):
@@ -115,17 +128,37 @@ def file_signature(path):
             stat.st_mtime_ns, stat.st_ctime_ns)
 
 
+@lru_cache(maxsize=16)
+def _file_sha256(signature):
+    digest = hashlib.sha256()
+    with Path(signature[0]).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _matches_shared_bonsai_vision(base, path):
+    if base.lower() != "ternary-bonsai-2-27b-uncensored-heretic":
+        return False
+    if path.name.lower() not in ("ternary-bonsai-2-27b-mmproj-q8_0.gguf",
+                                "mmproj-q8_0.gguf"):
+        return False
+    return _file_sha256(file_signature(path)) == _SHARED_BONSAI_VISION_SHA256
+
+
 def pick_mmproj(model_name, chosen):
     model_path = resolve_model(model_name)
-    base = re.sub(r"[.-](?:Q\d[^.]*|IQ\d[^.]*|BF16|F16|F32)$", "",
+    base = re.sub(r"[.-](?:Q\d[^.]*|IQ\d[^.]*|PTQ\d[^.]*|PQ\d[^.]*|BF16|F16|F32)$", "",
                   Path(model_name).stem, flags=re.IGNORECASE)
+    prefixes = tuple((base + separator + "mmproj").lower() for separator in (".", "-"))
     if chosen != "Auto":
         path = resolve_model(chosen, True)
-        if not path.name.lower().startswith((base + ".mmproj").lower()):
+        if (not path.name.lower().startswith(prefixes)
+                and not _matches_shared_bonsai_vision(base, path)):
             raise ValueError(f"vision file {path.name} does not match model {model_name}")
         return path
     matches = [path for path in model_path.parent.glob("*.gguf")
-               if path.is_file() and path.name.lower().startswith((base + ".mmproj").lower())]
+               if path.is_file() and path.name.lower().startswith(prefixes)]
     if len(matches) == 1:
         return matches[0]
     raise ValueError(f"No unique matching mmproj for {model_name}; select its vision model explicitly")
@@ -204,6 +237,24 @@ def prepare_images(images):
     return result, dimensions
 
 
+def load_system_prompt(task, system_prompt=None):
+    if system_prompt is not None and not isinstance(system_prompt, str):
+        raise ValueError("system_prompt must be text")
+    if system_prompt is not None and system_prompt.strip():
+        text = system_prompt.strip()
+        # A pasted chat template may contain a whole serialized conversation.
+        # Only the system body belongs in the API's system message.
+        if text.startswith("<|im_start|>system"):
+            text = text[len("<|im_start|>system"):].split("<|im_end|>", 1)[0].strip()
+            if not text:
+                raise ValueError("the pasted system message is empty")
+        return text, "custom", hashlib.sha256(text.encode("utf-8")).hexdigest()
+    name = "system_prompt_t2i.txt" if task == "t2i" else "system_prompt_edit_fast.txt"
+    data = (ROOT / "prompts" / name).read_bytes()
+    text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return text, "default", hashlib.sha256(data).hexdigest()
+
+
 def parse_answer(raw, task, image_count):
     decoder = json.JSONDecoder()
     parsed = []
@@ -249,6 +300,33 @@ def parse_answer(raw, task, image_count):
         if follow and follow not in {f"<image{i}>" for i in range(1, image_count + 1)}:
             raise ValueError(f"ratio_follow references an unavailable image: {follow}")
     return answer
+
+
+def parse_edit_answer(raw):
+    """Read edit prose, tolerating legacy JSON without using model canvas fields."""
+    text = raw.strip()
+    while text.startswith("<think>"):
+        end = text.find("</think>")
+        if end < 0:
+            raise ValueError("model returned an incomplete thinking block")
+        text = text[end + len("</think>"):].strip()
+    if text.startswith("</think>"):
+        raise ValueError("model returned an unmatched thinking block close")
+    fence = re.fullmatch(r"```(?:json|text)?\s*\n(.*?)\n```", text, re.S)
+    if fence:
+        text = fence.group(1).strip()
+    if text.startswith(("{", "[")):
+        try:
+            answer = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("model returned malformed edit JSON") from exc
+        if not isinstance(answer, dict) or not isinstance(answer.get("rewritten_prompt"), str):
+            raise ValueError("edit JSON must contain a rewritten_prompt string")
+        text = answer["rewritten_prompt"].strip()
+    if not text:
+        raise ValueError("rewritten_prompt is empty")
+    text = re.sub(r"\s*\n\s*", " ", text)
+    return {"rewritten_prompt": text, "wh_ratio": "", "ratio_follow": ""}
 
 
 def validate_references(answer, task, image_count, protected_literals=None):
@@ -437,9 +515,10 @@ class LocalServer:
             if path.is_file():
                 return path
             raise FileNotFoundError(path)
-        matches = list((ROOT / "runtime").rglob("llama-server.exe"))
+        name = "llama-server.exe" if os.name == "nt" else "llama-server"
+        matches = list((ROOT / "runtime").rglob(name))
         if len(matches) != 1:
-            raise FileNotFoundError("llama-server.exe not found; set QWEN_PE_LLAMA_SERVER")
+            raise FileNotFoundError(f"{name} not found; set QWEN_PE_LLAMA_SERVER")
         return matches[0]
 
     def stop(self):
@@ -476,7 +555,8 @@ class LocalServer:
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = sock.getsockname()[1]
-            command = [str(self.binary()), "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
+            binary = self.binary()
+            command = [str(binary), "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
                        "-c", str(context), "-ngl", str(gpu_layers), "--jinja", "--reasoning-format", "none",
                        "--parallel", "1", "--alias", "qwen-pe"]
             if mmproj:
@@ -485,8 +565,16 @@ class LocalServer:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self.log = log_path.open("ab")
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            environment = os.environ.copy()
+            if os.name == "posix":
+                # A Conda environment may carry another llama.cpp build. Keep
+                # this executable and its bundled libraries in the same build.
+                library_dir = str(binary.resolve().parent)
+                existing = environment.get("LD_LIBRARY_PATH")
+                environment["LD_LIBRARY_PATH"] = library_dir + (os.pathsep + existing if existing else "")
             try:
-                self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT, creationflags=flags)
+                self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT,
+                                                creationflags=flags, env=environment)
                 self.profile = profile
                 self.port = port
                 try:
@@ -513,16 +601,40 @@ class LocalServer:
                 raise
 
     def complete(self, task, prompt, images, seed, timeout,
-                 output_language="auto", aspect_ratio="auto", transparent_rgba=False):
+                 output_language="auto", aspect_ratio="auto", transparent_rgba=False,
+                 reasoning="auto", system_prompt=None, edit_max_tokens=DEFAULT_EDIT_MAX_TOKENS):
         with self.lock:
+            if task == "edit":
+                edit_max_tokens = validate_edit_max_tokens(edit_max_tokens)
+            if reasoning not in ("auto", "off", "on"):
+                raise ValueError("reasoning must be auto, off, or on")
+            model_name = Path(self.profile[0][0]).name.lower() if self.profile else ""
+            bonsai = model_name.startswith("ternary-bonsai-2-")
+            thinking = reasoning == "on" or (reasoning == "auto" and task == "t2i" and not bonsai)
             exact_literals = set(quoted_literals(prompt))
             if task == "edit":
                 # Numbered image tags are references even when the user puts
                 # quotation marks around them in an editing instruction.
                 exact_literals = {value for value in exact_literals
                                   if not re.fullmatch(r"<image\d+>", value)}
-            system_name = "system_prompt_t2i.txt" if task == "t2i" else "system_prompt_edit.txt"
-            system = (ROOT / "prompts" / system_name).read_text(encoding="utf-8").strip()
+            system, system_source, system_hash = load_system_prompt(task, system_prompt)
+            if task == "edit":
+                # Editing preserves a caller-selected reference canvas. The LLM
+                # rewrites prose only; it never chooses a ratio or canvas image.
+                system += ("\n\nRequired node response format: Return only the complete editing "
+                           "instruction as one plain-text paragraph. No JSON, field names, markdown, "
+                           "reasoning, explanation, resolution, or aspect-ratio information. "
+                           "Preserve all unrequested content. "
+                           "Keep the input canvas unchanged.")
+            elif system_source == "custom":
+                # Custom rewriting instructions still feed PE_RESULT / Canvas.
+                # Keep their machine-readable output contract explicit.
+                fields = '"rewritten_prompt", "wh_ratio"'
+                system += ("\n\nRequired node response format: Return one JSON object with exactly "
+                           f"these fields: {fields}. All values must be strings. "
+                           "rewritten_prompt contains the complete rewritten image instruction. "
+                           "Return no markdown, explanation, or extra fields. ")
+                system += 'wh_ratio must be a positive integer aspect ratio such as "1:1".'
             content = [{"type": "image_url", "image_url": {"url": value}} for value in images]
             if not images:
                 reference_rule = ("There are no input images. Do not write <image>, "
@@ -543,7 +655,7 @@ class LocalServer:
                 system += (f"\n\nUser-selected language override: Write all descriptive prose of "
                            f"rewritten_prompt in {language}. Preserve exact user-requested text to be "
                            "rendered inside quotation marks, even if it is in another language.")
-            if aspect_ratio != "auto":
+            if task == "t2i" and aspect_ratio != "auto":
                 system += (f"\n\nUser-selected canvas override: Set wh_ratio to {aspect_ratio}, "
                            "ratio_follow to an empty string, and describe the output composition for this ratio.")
             if transparent_rgba:
@@ -567,11 +679,19 @@ class LocalServer:
                 "top_k": 20,
                 "min_p": 0.0,
                 "presence_penalty": 1.5 if task == "t2i" else 0.0,
-                "max_tokens": 16256 if task == "t2i" else 24000,
+                "max_tokens": 16256 if task == "t2i" else edit_max_tokens,
                 "seed": seed,
-                "chat_template_kwargs": {"enable_thinking": True},
+                "chat_template_kwargs": {"enable_thinking": thinking},
                 "stream": False,
             }
+            if bonsai:
+                # The base PE defaults enable reasoning. Bonsai defaults to
+                # xhigh, which adds a long hidden trace to a short edit rewrite.
+                payload.update(temperature=1.0 if thinking else 0.7,
+                               top_p=0.95 if thinking else 0.8,
+                               min_p=0.05 if thinking else 0.0,
+                               presence_penalty=0.0 if thinking else 1.5,
+                               repetition_penalty=1.0)
             first_error = None
             truncation_retry = False
             for attempt in range(2):
@@ -591,17 +711,24 @@ class LocalServer:
                     if attempt:
                         suffix = ("; retry without thinking was also truncated" if truncation_retry
                                   else "; format-retry response was truncated")
+                        if task == "edit":
+                            suffix += "; increase edit_max_tokens or reduce image/input tokens"
                         raise ValueError(error + suffix)
                     first_error = error
                     truncation_retry = True
                     payload["chat_template_kwargs"] = {"enable_thinking": False}
+                    if task == "edit":
+                        # Retry without thinking within the caller-selected budget.
+                        final_format = "complete editing instruction as one plain-text paragraph"
+                    else:
+                        final_format = "final JSON object with the required fields"
                     payload["messages"][0]["content"] = (
-                        system + "\n\nThe previous response was truncated. Return only the final "
-                        "JSON object with the required fields; do not include reasoning or commentary.")
+                        system + "\n\nThe previous response was truncated. Return only the " +
+                        final_format + "; do not include reasoning or commentary.")
                     continue
                 raw = choice["message"].get("content") or ""
                 try:
-                    answer = parse_answer(raw, task, len(images))
+                    answer = parse_edit_answer(raw) if task == "edit" else parse_answer(raw, task, len(images))
                     normalized_single_image_tags = 0
                     if task == "edit" and len(images) == 1:
                         answer["rewritten_prompt"], normalized_single_image_tags = (
@@ -621,7 +748,11 @@ class LocalServer:
                     translation_fallback = False
                     translation_usage = None
                     try:
-                        validate_language(answer, output_language, exact_literals)
+                        # In editing, image text and proper names can legitimately
+                        # use other scripts. Language is guided by the prompt;
+                        # avoid a second inference solely to translate that text.
+                        if task == "t2i":
+                            validate_language(answer, output_language, exact_literals)
                     except ValueError:
                         if output_language == "auto":
                             raise
@@ -644,9 +775,19 @@ class LocalServer:
                             normalized_margin_phrases += normalized_more
                         validate_references(answer, task, len(images), exact_literals)
                         validate_language(answer, output_language, exact_literals)
-                    validate_mode(answer, aspect_ratio, transparent_rgba, exact_literals)
+                    validate_mode(answer, aspect_ratio if task == "t2i" else "auto",
+                                  transparent_rgba, exact_literals)
                     return answer, {"finish_reason": choice.get("finish_reason"),
                                     "usage": result.get("usage", {}),
+                                    "max_tokens": payload["max_tokens"],
+                                    "system_prompt_source": system_source,
+                                    "system_prompt_sha256": system_hash,
+                                    "effective_system_prompt_sha256": hashlib.sha256(
+                                        payload["messages"][0]["content"].encode("utf-8")).hexdigest(),
+                                    "reasoning": reasoning,
+                                    "response_format": "plain_text" if task == "edit" else "json",
+                                    "thinking_enabled": payload["chat_template_kwargs"]["enable_thinking"],
+                                    "timings": result.get("timings"),
                                     "format_retries": attempt, "first_format_error": first_error,
                                     "truncation_retry": truncation_retry,
                                     "normalized_single_image_tags": normalized_single_image_tags,
@@ -659,11 +800,11 @@ class LocalServer:
                     if attempt:
                         raise ValueError(f"model failed format validation after one retry: {exc}") from exc
                     first_error = str(exc)
+                    final_format = ("complete editing instruction as one plain-text paragraph" if task == "edit"
+                                    else "final JSON object satisfying all language and aspect-ratio constraints")
                     system += ("\n\nThe previous output failed validation: " + first_error +
-                               ". Retry the same user request and satisfy all JSON, language, "
-                               "aspect-ratio, and image-reference constraints. " +
-                               reference_rule + " Return only the final JSON object, "
-                               "without reasoning or commentary.")
+                               ". Retry the same user request. " + reference_rule +
+                               " Return only the " + final_format + ", without reasoning or commentary.")
                     payload["messages"][0]["content"] = system
                     payload["chat_template_kwargs"] = {"enable_thinking": False}
             raise AssertionError("unreachable")

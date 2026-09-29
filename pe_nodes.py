@@ -7,8 +7,10 @@ import time
 
 import torch
 
-from .pe_runtime import (DEFAULT_EDIT, DEFAULT_T2I, SERVER, file_signature, local_models,
-                         pick_mmproj, prepare_images, quoted_literals, resolve_model, strip_quoted_literals)
+from .pe_runtime import (DEFAULT_EDIT, DEFAULT_EDIT_MAX_TOKENS, DEFAULT_T2I, MAX_EDIT_TOKENS,
+                         SERVER, file_signature, load_system_prompt,
+                         local_models, pick_mmproj, prepare_images, quoted_literals, resolve_model,
+                         strip_quoted_literals, validate_edit_max_tokens)
 
 
 ASPECT_RATIOS = ["auto", "1:1", "1:2", "2:3", "3:4", "4:5", "16:9",
@@ -57,7 +59,7 @@ class QwenPERewrite:
                 "user_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "task": (["auto", "t2i", "edit"], {"default": "auto"}),
                 "aspect_ratio": (ASPECT_RATIOS, {"default": "auto",
-                                                 "tooltip": "auto 使用模型建议；指定比例将覆盖模型比例并控制 Canvas。"}),
+                                                 "tooltip": "文生图使用模型建议或指定比例；图片编辑始终保持 canvas_image 参考图比例。"}),
                 "output_language": (["auto", "中文", "English"], {"default": "auto",
                                                                     "tooltip": "控制改写描述的语言；图内原文保留用户指定文字。"}),
                 "transparent_rgba": ("BOOLEAN", {"default": False,
@@ -68,7 +70,18 @@ class QwenPERewrite:
                 "model_lifetime": (["after_run", "keep_loaded"], {"default": "after_run"}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0x7FFFFFFF}),
             },
-            "optional": images,
+            "optional": {
+                **images,
+                "reasoning": (["auto", "off", "on"], {"default": "auto",
+                              "tooltip": "auto: 图片编辑与 Bonsai 默认关闭思考；off/on 显式控制。"}),
+                "system_prompt": ("STRING", {"forceInput": True,
+                                  "tooltip": "外接系统提示词替换默认模板；空文本回退默认。编辑只输出纯文本；粘贴 ChatML 时仅提取 system 正文。"}),
+                "canvas_image": ("INT", {"default": 1, "min": 1, "max": 10,
+                                  "tooltip": "图片编辑固定沿用哪张参考图的画布比例，按实际有图的输入顺序编号。"}),
+                "edit_max_tokens": ("INT", {"default": DEFAULT_EDIT_MAX_TOKENS, "min": 1,
+                                          "max": MAX_EDIT_TOKENS,
+                                          "tooltip": "图片编辑的生成 token 上限（含启用的思考）；重试也遵守此值。详略由 system_prompt 控制，实际长度仍受模型上下文剩余空间限制。"}),
+            },
         }
 
     RETURN_TYPES = ("STRING", "PE_RESULT", "STRING")
@@ -82,7 +95,7 @@ class QwenPERewrite:
         root = Path(__file__).resolve().parent
         fingerprint.update((root / "pe_nodes.py").read_bytes())
         fingerprint.update((root / "pe_runtime.py").read_bytes())
-        for template in ("system_prompt_t2i.txt", "system_prompt_edit.txt"):
+        for template in ("system_prompt_t2i.txt", "system_prompt_edit_fast.txt"):
             fingerprint.update((root / "prompts" / template).read_bytes())
         # Comfy calls IS_CHANGED before resolving linked IMAGE outputs. Linked
         # values arrive as None here, so auto must include both possible models.
@@ -109,7 +122,8 @@ class QwenPERewrite:
 
     def rewrite(self, user_prompt, task, aspect_ratio, output_language, transparent_rgba,
                 t2i_model, edit_model, vision_model,
-                model_lifetime, seed, **kwargs):
+                model_lifetime, seed, reasoning="auto", system_prompt=None, canvas_image=1,
+                edit_max_tokens=DEFAULT_EDIT_MAX_TOKENS, **kwargs):
         if not user_prompt.strip():
             raise ValueError("Enter a text instruction; image-only requests need an explicit editing goal")
         present = sorted((int(key.split("_")[-1]), value) for key, value in kwargs.items() if value is not None)
@@ -117,10 +131,16 @@ class QwenPERewrite:
         if len(images) > 10:
             raise ValueError("At most 10 reference images are supported")
         actual_task = ("edit" if images else "t2i") if task == "auto" else task
+        if actual_task == "edit":
+            edit_max_tokens = validate_edit_max_tokens(edit_max_tokens)
         if actual_task == "edit" and not images:
             raise ValueError("edit requires at least one image")
         if actual_task == "t2i" and images:
             raise ValueError("t2i cannot receive images; use edit for image-conditioned generation")
+        if actual_task == "edit" and (not isinstance(canvas_image, int) or isinstance(canvas_image, bool)
+                                       or not 1 <= canvas_image <= len(images)):
+            raise ValueError("canvas_image must select an available input image")
+        _, template_source, template_hash = load_system_prompt(actual_task, system_prompt)
         model_name = t2i_model if actual_task == "t2i" else edit_model
         model = resolve_model(model_name)
         mmproj = pick_mmproj(model_name, vision_model) if actual_task == "edit" else None
@@ -137,20 +157,24 @@ class QwenPERewrite:
         with SERVER.lock:
             try:
                 SERVER.start(model, mmproj, context, 99)
+                server_ready = time.monotonic()
                 answer, info = SERVER.complete(actual_task, user_prompt, encoded, seed, 900,
-                                               output_language, aspect_ratio, transparent_rgba)
+                                               output_language, aspect_ratio, transparent_rgba,
+                                               reasoning=reasoning, system_prompt=system_prompt,
+                                               edit_max_tokens=edit_max_tokens)
             finally:
                 if model_lifetime == "after_run":
                     SERVER.stop()
         model_wh_ratio = answer["wh_ratio"]
         model_ratio_follow = answer.get("ratio_follow", "")
-        if aspect_ratio != "auto":
+        if actual_task == "edit":
+            answer["wh_ratio"] = ""
+            answer["ratio_follow"] = f"<image{canvas_image}>"
+        elif aspect_ratio != "auto":
             answer["wh_ratio"] = aspect_ratio
             answer["ratio_follow"] = ""
         language = _resolved_language(output_language, answer["rewritten_prompt"], user_prompt)
         final_prompt = _format_prompt(answer["rewritten_prompt"], transparent_rgba, language)
-        template_name = "system_prompt_t2i.txt" if actual_task == "t2i" else "system_prompt_edit.txt"
-        template_hash = hashlib.sha256((Path(__file__).resolve().parent / "prompts" / template_name).read_bytes()).hexdigest()
         result = {
             "task": actual_task,
             "rewritten_prompt": final_prompt,
@@ -158,7 +182,9 @@ class QwenPERewrite:
             "ratio_follow": answer.get("ratio_follow", ""),
             "model_wh_ratio": model_wh_ratio,
             "model_ratio_follow": model_ratio_follow,
-            "selected_aspect_ratio": aspect_ratio,
+            "selected_aspect_ratio": "auto" if actual_task == "edit" else aspect_ratio,
+            "canvas_image": canvas_image if actual_task == "edit" else None,
+            "response_format": info.get("response_format"),
             "output_language": language,
             "transparent_rgba": transparent_rgba,
             "image_dimensions": dimensions,
@@ -166,8 +192,16 @@ class QwenPERewrite:
             "image_fingerprints": image_fingerprints,
             "model": model.name,
             "mmproj": mmproj.name if mmproj else "",
+            "system_prompt_source": template_source,
             "system_prompt_sha256": template_hash,
+            "effective_system_prompt_sha256": info.get("effective_system_prompt_sha256"),
             "elapsed_seconds": round(time.monotonic() - started, 2),
+            "server_startup_seconds": round(server_ready - started, 2),
+            "reasoning": info.get("reasoning", reasoning),
+            "thinking_enabled": info.get("thinking_enabled"),
+            "edit_max_tokens": edit_max_tokens if actual_task == "edit" else None,
+            "max_tokens": info.get("max_tokens"),
+            "timings": info.get("timings"),
             "seed": seed,
             "finish_reason": info["finish_reason"],
             "usage": info["usage"],

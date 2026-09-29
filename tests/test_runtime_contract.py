@@ -1,5 +1,6 @@
 import os
 import base64
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -14,7 +15,7 @@ from PIL import Image
 
 from pe_runtime import (DEFAULT_EDIT, DEFAULT_T2I, DEFAULT_MMPROJ,
                         LocalServer, file_signature, local_models,
-                        normalize_single_image_references, parse_answer, pick_mmproj,
+                        load_system_prompt, normalize_single_image_references, parse_answer, parse_edit_answer, pick_mmproj,
                         prepare_images, quoted_literals,
                         remove_opaque_background_sentences, validate_language, validate_mode,
                         validate_references)
@@ -192,9 +193,15 @@ class RuntimeContractTests(unittest.TestCase):
                 self.assertNotIn("another.mmproj.gguf", local_models())
 
     def test_known_vision_project_cannot_pair_with_t2i_weight(self):
-        self.assertEqual(pick_mmproj(DEFAULT_EDIT, "Auto").name, DEFAULT_MMPROJ)
-        with self.assertRaises(ValueError):
-            pick_mmproj(DEFAULT_T2I, DEFAULT_MMPROJ)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in (DEFAULT_EDIT, DEFAULT_T2I, DEFAULT_MMPROJ):
+                (root / name).write_bytes(b"fixture")
+            with patch("pe_runtime.model_roots", side_effect=lambda: iter([root])):
+                self.assertEqual(pick_mmproj(DEFAULT_EDIT, "Auto").name, DEFAULT_MMPROJ)
+            with patch("pe_runtime.model_roots", side_effect=lambda: iter([root])):
+                with self.assertRaises(ValueError):
+                    pick_mmproj(DEFAULT_T2I, DEFAULT_MMPROJ)
 
     def test_auto_vision_model_uses_the_model_directory(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -245,6 +252,133 @@ class RuntimeContractTests(unittest.TestCase):
                 self.assertEqual(pick_mmproj(model.name, vision.name), vision)
                 with self.assertRaises(ValueError):
                     pick_mmproj(model.name, other.name)
+
+    def test_bonsai_packings_pair_with_matching_hyphenated_projector(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            vision = root / "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
+            other = root / "Another-27B-mmproj-Q8_0.gguf"
+            vision.write_bytes(b"vision")
+            other.write_bytes(b"other")
+            for packing in ("PTQ1_0", "PQ2_0"):
+                model = root / f"Ternary-Bonsai-2-27B-{packing}.gguf"
+                model.write_bytes(b"model")
+                with (self.subTest(packing=packing),
+                      patch("pe_runtime.model_roots", side_effect=lambda: iter([root]))):
+                    self.assertEqual(pick_mmproj(model.name, "Auto"), vision)
+                    self.assertEqual(pick_mmproj(model.name, vision.name), vision)
+                    with self.assertRaises(ValueError):
+                        pick_mmproj(model.name, other.name)
+                    second = root / "Ternary-Bonsai-2-27B-mmproj-BF16.gguf"
+                    second.write_bytes(b"vision")
+                    with self.assertRaisesRegex(ValueError, "unique matching"):
+                        pick_mmproj(model.name, "Auto")
+                    self.assertEqual(pick_mmproj(model.name, vision.name), vision)
+                    second.unlink()
+
+    def test_bonsai_heretic_accepts_verified_shared_q8_projector(self):
+        import pe_runtime
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = root / "Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf"
+            model.write_bytes(b"model")
+            fixture = b"trusted Q8 projector"
+            shared_names = ("Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf", "mmproj-Q8_0.gguf")
+            own = root / "Ternary-Bonsai-2-27B-Uncensored-Heretic-mmproj-Q8_0.gguf"
+            own.write_bytes(fixture)
+            for name in shared_names:
+                (root / name).write_bytes(fixture)
+            with (patch("pe_runtime.model_roots", side_effect=lambda: iter([root])),
+                  patch.object(pe_runtime, "_SHARED_BONSAI_VISION_SHA256",
+                               hashlib.sha256(fixture).hexdigest())):
+                for name in shared_names:
+                    with self.subTest(vision=name):
+                        self.assertEqual(pick_mmproj(model.name, name), root / name)
+                self.assertEqual(pick_mmproj(model.name, "Auto"), own)
+
+    def test_bonsai_shared_projector_rejects_wrong_content_and_other_models(self):
+        import pe_runtime
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            vision = root / "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
+            vision.write_bytes(b"wrong projector")
+            model = root / "Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf"
+            other = root / "pe_i2i_heretic-Q4_K_M.gguf"
+            for path in (model, other):
+                path.write_bytes(b"model")
+            with (patch("pe_runtime.model_roots", side_effect=lambda: iter([root])),
+                  patch.object(pe_runtime, "_SHARED_BONSAI_VISION_SHA256",
+                               hashlib.sha256(b"trusted Q8 projector").hexdigest())):
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    pick_mmproj(model.name, vision.name)
+                vision.write_bytes(b"trusted Q8 projector")
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    pick_mmproj(other.name, vision.name)
+
+    def test_projector_digest_cache_invalidates_same_size_atomic_replacement(self):
+        import pe_runtime
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            vision = root / "vision.gguf"
+            vision.write_bytes(b"old")
+            stat = vision.stat()
+            replacement = root / "replacement.gguf"
+            replacement.write_bytes(b"new")
+            os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            pe_runtime._file_sha256.cache_clear()
+            with patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
+                for _ in range(2):
+                    self.assertEqual(pe_runtime._file_sha256(file_signature(vision)),
+                                     hashlib.sha256(b"old").hexdigest())
+                self.assertEqual(opened.call_count, 1)
+                os.replace(replacement, vision)
+                self.assertEqual(pe_runtime._file_sha256(file_signature(vision)),
+                                 hashlib.sha256(b"new").hexdigest())
+                self.assertEqual(opened.call_count, 2)
+            pe_runtime._file_sha256.cache_clear()
+
+    def test_runtime_discovery_selects_native_platform_executable(self):
+        import pe_runtime
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            for name in ("llama-server", "llama-server.exe"):
+                (runtime / name).write_bytes(b"runtime")
+            for platform, name in (("posix", "llama-server"), ("nt", "llama-server.exe")):
+                with (self.subTest(platform=platform),
+                      patch.object(pe_runtime, "ROOT", root),
+                      patch.object(pe_runtime, "os", types.SimpleNamespace(name=platform, environ={}))):
+                    self.assertEqual(LocalServer.binary(), runtime / name)
+
+    def test_server_prefers_its_own_libraries_without_changing_parent_environment(self):
+        import pe_runtime
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = root / "model.gguf"
+            model.write_bytes(b"model")
+            binary = root / "bundled" / "llama-server"
+            process = MagicMock()
+            process.poll.return_value = None
+            health = MagicMock()
+            health.status = 200
+            health.__enter__.return_value = health
+            inherited = "/shared/upstream-libraries:/another-directory"
+            with (patch.object(pe_runtime, "ROOT", root),
+                  patch.object(LocalServer, "binary", return_value=binary),
+                  patch.object(pe_runtime.subprocess, "Popen", return_value=process) as launch,
+                  patch.object(pe_runtime, "urlopen", return_value=health),
+                  patch.dict(os.environ, {"LD_LIBRARY_PATH": inherited})):
+                server = LocalServer()
+                try:
+                    server.start(model, None, 1024, 0)
+                    environment = launch.call_args.kwargs["env"]
+                    if os.name == "posix":
+                        self.assertEqual(environment["LD_LIBRARY_PATH"],
+                                         str(binary.resolve().parent) + os.pathsep + inherited)
+                    self.assertEqual(os.environ["LD_LIBRARY_PATH"], inherited)
+                finally:
+                    server.stop()
 
     def test_file_signature_changes_for_same_size_atomic_replacement(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -327,6 +461,240 @@ class RuntimeContractTests(unittest.TestCase):
                                         [], 42, 1, aspect_ratio="4:5", transparent_rgba=True)
         self.assertIn('"white background"', actual["rewritten_prompt"])
 
+    def test_custom_system_prompt_replaces_template_and_keeps_node_contract(self):
+        for task, images, answer in (
+            ("t2i", [], {"rewritten_prompt": "A blue cat.", "wh_ratio": "1:1"}),
+            ("edit", ["a", "b"], {"rewritten_prompt": "Blend <image1> into <image2>.",
+                                  "wh_ratio": "", "ratio_follow": "<image2>"}),
+        ):
+            with self.subTest(task=task), tempfile.TemporaryDirectory() as temp:
+                server = LocalServer()
+                custom = "  External rewriting policy.\nPreserve the requested edit.  "
+                response = {"choices": [{"message": {"content": json.dumps(answer)},
+                                          "finish_reason": "stop"}], "usage": {}}
+                # No built-in template files exist: a supplied prompt replaces them.
+                with (patch("pe_runtime.ROOT", Path(temp)),
+                      patch.object(server, "_post_completion", return_value=response) as completion):
+                    actual, info = server.complete(task, "Make the edit", images, 42, 1,
+                                                   output_language="English", system_prompt=custom)
+                system = completion.call_args.args[0]["messages"][0]["content"]
+                self.assertTrue(system.startswith(custom.strip()))
+                self.assertIn("Required node response format", system)
+                self.assertIn("Runtime image-reference rule", system)
+                self.assertIn("User-selected language override", system)
+                expected = dict(answer)
+                if task == "edit":
+                    expected.update(wh_ratio="", ratio_follow="")
+                    self.assertIn("one plain-text paragraph. No JSON", system)
+                    self.assertNotIn("Set exactly one of wh_ratio", system)
+                self.assertEqual(actual, expected)
+                self.assertEqual(info["system_prompt_source"], "custom")
+                self.assertEqual(info["system_prompt_sha256"],
+                                 hashlib.sha256(custom.strip().encode()).hexdigest())
+                self.assertEqual(info["effective_system_prompt_sha256"],
+                                 hashlib.sha256(system.encode()).hexdigest())
+
+    def test_empty_external_system_prompt_keeps_default_template(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "prompts").mkdir()
+            for task in ("t2i", "edit"):
+                name = "system_prompt_t2i.txt" if task == "t2i" else "system_prompt_edit_fast.txt"
+                template = f"Built-in {task} policy.\r\nPreserve the image.\r\n"
+                (root / "prompts" / name).write_bytes(template.encode())
+                images = [] if task == "t2i" else ["a"]
+                answer = {"rewritten_prompt": "A blue cat.", "wh_ratio": "1:1"}
+                if task == "edit":
+                    answer["ratio_follow"] = ""
+                response = {"choices": [{"message": {"content": json.dumps(answer)},
+                                          "finish_reason": "stop"}], "usage": {}}
+                for custom in (None, "", " \n\t "):
+                    with self.subTest(task=task, custom=custom):
+                        server = LocalServer()
+                        with (patch("pe_runtime.ROOT", root),
+                              patch.object(server, "_post_completion", return_value=response) as completion):
+                            _, info = server.complete(task, "Blue cat", images, 42, 1,
+                                                      system_prompt=custom)
+                        system = completion.call_args.args[0]["messages"][0]["content"]
+                        self.assertTrue(system.startswith(template.replace("\r\n", "\n").strip()))
+                        self.assertEqual("Required node response format" in system, task == "edit")
+                        self.assertEqual(info["system_prompt_source"], "default")
+                        self.assertEqual(info["system_prompt_sha256"],
+                                         hashlib.sha256(template.encode()).hexdigest())
+
+    def test_edit_accepts_plain_text_and_ignores_model_ratio_fields(self):
+        prose = 'Remove the marked object and preserve the rest of the image.'
+        variants = [prose, prose.replace(' and ', '\n and '),
+                    '<think>hidden draft</think>\n' + prose,
+                    '```text\n' + prose + '\n```']
+        for ratio, follow in (("", ""), ("4:3", "<image9>"), ("bad", "bad")):
+            variants.append(json.dumps({"rewritten_prompt": prose,
+                                        "wh_ratio": ratio, "ratio_follow": follow}))
+        variants.append(json.dumps({"rewritten_prompt": prose}))
+        for raw in variants:
+            with self.subTest(raw=raw):
+                self.assertEqual(parse_edit_answer(raw),
+                                 {"rewritten_prompt": prose, "wh_ratio": "", "ratio_follow": ""})
+        for raw in ("", "<think>unfinished", '{"rewritten_prompt":',
+                    '{"rewritten_prompt":42}', '{"answer":"missing prompt"}'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse_edit_answer(raw)
+
+    def test_edit_extracts_pasted_chatml_system_and_preserves_plain_contract(self):
+        policy = "Rewrite the edit as plain text; no JSON or ratio."
+        custom = ("<|im_start|>system\n" + policy + "\n<|im_end|>\n"
+                  "<|im_start|>user\n<|image_pad|>{编辑指令}<|im_end|>\n"
+                  "<|im_start|>assistant\n<think>")
+        text, source, digest = load_system_prompt("edit", custom)
+        self.assertEqual((text, source), (policy, "custom"))
+        self.assertEqual(digest, hashlib.sha256(policy.encode()).hexdigest())
+        server = LocalServer()
+        response = {"choices": [{"message": {"content": "Remove the marked object."},
+                                 "finish_reason": "stop"}], "usage": {}}
+        with patch.object(server, "_post_completion", return_value=response) as completion:
+            answer, info = server.complete("edit", "移除红色区域内部的主体", ["a"], 42, 1,
+                                           output_language="English", aspect_ratio="16:9", system_prompt=custom)
+        payload = completion.call_args.args[0]
+        system = payload["messages"][0]["content"]
+        self.assertTrue(system.startswith(policy))
+        for marker in ("<|im_start|>", "<|image_pad|>", "{编辑指令}", "<think>", "Set wh_ratio"):
+            self.assertNotIn(marker, system)
+        self.assertFalse(payload["chat_template_kwargs"]["enable_thinking"])
+        self.assertEqual(answer["rewritten_prompt"], "Remove the marked object.")
+        self.assertEqual(info["format_retries"], 0)
+
+    def test_edit_does_not_translate_literal_image_text_or_proper_names(self):
+        server = LocalServer()
+        prose = 'Remove the object beside the sign "夏日特惠" and preserve the label.'
+        response = {"choices": [{"message": {"content": prose}, "finish_reason": "stop"}], "usage": {}}
+        with (patch.object(server, "_post_completion", return_value=response) as completion,
+              patch.object(server, "_translate_prose") as translate):
+            answer, info = server.complete("edit", "移除标牌旁边的物体", ["a"], 42, 1,
+                                           output_language="English")
+        self.assertEqual(answer["rewritten_prompt"], prose)
+        self.assertEqual(completion.call_count, 1)
+        translate.assert_not_called()
+        self.assertFalse(info["translation_fallback"])
+
+    def test_edit_never_accepts_a_truncated_directive(self):
+        server = LocalServer()
+        requests = []
+        def reply(payload, timeout):
+            requests.append((payload["max_tokens"], payload["messages"][0]["content"]))
+            return {"choices": [{"message": {"content": "unfinished"}, "finish_reason": "length"}],
+                    "usage": {"completion_tokens": payload["max_tokens"]}}
+        with patch.object(server, "_post_completion", side_effect=reply):
+            with self.assertRaisesRegex(ValueError, "also truncated"):
+                server.complete("edit", "Remove the marked object", ["a"], 42, 1)
+        self.assertEqual([limit for limit, _ in requests], [1536, 1536])
+        self.assertIn("one plain-text paragraph", requests[1][1])
+        self.assertNotIn("final JSON object", requests[1][1])
+
+    def test_edit_budget_and_external_verbosity_are_caller_controlled(self):
+        server = LocalServer()
+        detailed = ("Rebuild the selected fabric region with continuous fine woven texture, "
+                    "matching fold directions, gradual shading, and nearby reflected light. "
+                    "Preserve the original seams and the visible outline of the hand. ") * 8
+        for budget, policy in ((8192, "Write a detailed editing directive with all relevant visual details."),
+                               (65536, "Keep this directive concise.")):
+            with self.subTest(budget=budget):
+                response = {"choices": [{"message": {"content": detailed}, "finish_reason": "stop"}],
+                            "usage": {}}
+                with patch.object(server, "_post_completion", return_value=response) as completion:
+                    answer, info = server.complete("edit", "Rebuild the marked region", ["a"], 42, 1,
+                                                   system_prompt=policy, edit_max_tokens=budget)
+                payload = completion.call_args.args[0]
+                system = payload["messages"][0]["content"]
+                self.assertTrue(system.startswith(policy))
+                self.assertNotIn("Keep the edit concise", system)
+                self.assertEqual(payload["max_tokens"], budget)
+                self.assertEqual(info["max_tokens"], budget)
+                self.assertEqual(answer["rewritten_prompt"], detailed.strip())
+
+    def test_edit_truncation_retry_respects_the_selected_budget(self):
+        server = LocalServer()
+        requests = []
+        policy = "Describe every relevant texture, structure, and lighting detail."
+        def reply(payload, timeout):
+            requests.append(json.loads(json.dumps(payload)))
+            content = "unfinished" if len(requests) == 1 else "Rebuild the fabric with matching folds."
+            return {"choices": [{"message": {"content": content},
+                                  "finish_reason": "length" if len(requests) == 1 else "stop"}],
+                    "usage": {}}
+        with patch.object(server, "_post_completion", side_effect=reply):
+            answer, info = server.complete("edit", "Rebuild the marked region", ["a"], 42, 1,
+                reasoning="on", system_prompt=policy, edit_max_tokens=8192)
+        self.assertEqual([request["max_tokens"] for request in requests], [8192, 8192])
+        self.assertEqual([request["chat_template_kwargs"]["enable_thinking"] for request in requests], [True, False])
+        self.assertTrue(all(request["messages"][0]["content"].startswith(policy) for request in requests))
+        self.assertEqual(info["max_tokens"], 8192)
+        self.assertTrue(info["truncation_retry"])
+        self.assertEqual(answer["rewritten_prompt"], "Rebuild the fabric with matching folds.")
+
+    def test_invalid_edit_budgets_fail_before_completion(self):
+        server = LocalServer()
+        for budget in (0, -1, True, 1.5, "4096", 65537):
+            with self.subTest(budget=budget), patch.object(server, "_post_completion") as completion:
+                with self.assertRaisesRegex(ValueError, "edit_max_tokens"):
+                    server.complete("edit", "Make the edit", ["a"], 42, 1, edit_max_tokens=budget)
+                completion.assert_not_called()
+
+    def test_text_to_image_budget_is_unaffected_by_edit_option(self):
+        server = LocalServer()
+        response = {"choices": [{"message": {"content": '{"rewritten_prompt":"A blue cat.","wh_ratio":"1:1"}'},
+                                 "finish_reason": "stop"}], "usage": {}}
+        with patch.object(server, "_post_completion", return_value=response) as completion:
+            _, info = server.complete("t2i", "A blue cat", [], 42, 1, edit_max_tokens=1)
+        self.assertEqual(completion.call_args.args[0]["max_tokens"], 16256)
+        self.assertEqual(info["max_tokens"], 16256)
+
+    def test_custom_system_prompt_preserves_validation_on_retry(self):
+        server = LocalServer()
+        systems = []
+        def response(payload, timeout):
+            systems.append(payload["messages"][0]["content"])
+            prompt = ("Blend <image1>." if len(systems) == 1 else
+                      "Blend <image1> into <image2>.")
+            return {"choices": [{"message": {"content": json.dumps({
+                "rewritten_prompt": prompt, "wh_ratio": "", "ratio_follow": "<image2>"})},
+                "finish_reason": "stop"}], "usage": {}}
+        with patch.object(server, "_post_completion", side_effect=response):
+            _, info = server.complete("edit", "Blend the images", ["a", "b"], 42, 1,
+                                      system_prompt="External blend policy.")
+        self.assertEqual(info["format_retries"], 1)
+        self.assertTrue(all(system.startswith("External blend policy.") for system in systems))
+        self.assertIn("previous output failed validation", systems[1])
+        self.assertEqual(info["system_prompt_source"], "custom")
+
+    def test_bonsai_auto_disables_thinking_and_explicit_override_is_respected(self):
+        cases = (
+            ("Ternary-Bonsai-2-27B-PTQ1_0.gguf", "auto", False, 0.7, 0.8, 1.5),
+            ("Ternary-Bonsai-2-27B-PQ2_0.gguf", "auto", False, 0.7, 0.8, 1.5),
+            ("Ternary-Bonsai-2-27B-PQ2_0.gguf", "on", True, 1.0, 0.95, 0.0),
+            (DEFAULT_EDIT, "auto", False, 1.0, 0.95, 0.0),
+            (DEFAULT_EDIT, "off", False, 1.0, 0.95, 0.0),
+        )
+        for name, reasoning, thinking, temperature, top_p, penalty in cases:
+            with self.subTest(name=name, reasoning=reasoning):
+                server = LocalServer()
+                server.profile = ((name, 0, 0), None, 49152, 99)
+                response = {"choices": [{"message": {"content": json.dumps({
+                    "rewritten_prompt": "Blend <image1> into <image2>.",
+                    "wh_ratio": "", "ratio_follow": "<image2>"})}, "finish_reason": "stop"}],
+                    "usage": {"completion_tokens": 20}, "timings": {"prompt_ms": 100}}
+                with patch.object(server, "_post_completion", return_value=response) as completion:
+                    _, info = server.complete("edit", "Blend the images", ["a", "b"],
+                                              42, 1, reasoning=reasoning)
+                payload = completion.call_args.args[0]
+                self.assertEqual(payload["chat_template_kwargs"]["enable_thinking"], thinking)
+                self.assertEqual((payload["temperature"], payload["top_p"], payload["presence_penalty"]),
+                                 (temperature, top_p, penalty))
+                self.assertEqual(info["thinking_enabled"], thinking)
+                self.assertEqual(payload["max_tokens"], 1536)
+                self.assertEqual(info["response_format"], "plain_text")
+                self.assertEqual(info["timings"], response["timings"])
+                self.assertEqual(info["format_retries"], 0)
+
     def test_truncated_completion_retries_without_thinking_then_validates(self):
         server = LocalServer()
         server.profile = ("model", None, 24576, 99)
@@ -385,8 +753,11 @@ class RuntimeContractTests(unittest.TestCase):
                                          "finish_reason": "stop"}], "usage": {}}
                 with patch.object(server, "_post_completion", side_effect=reply):
                     answer, info = server.complete(task, "Change the image.", images, 42, 1)
-                self.assertEqual(answer, valid)
-                self.assertEqual([thinking for thinking, _ in requests], [True, False])
+                expected = dict(valid)
+                if task == "edit":
+                    expected.update(wh_ratio="", ratio_follow="")
+                self.assertEqual(answer, expected)
+                self.assertEqual([thinking for thinking, _ in requests], [task == "t2i", False])
                 self.assertIn(rule, requests[0][1])
                 self.assertIn(rule, requests[1][1])
                 self.assertIn("<image>", info["first_format_error"])

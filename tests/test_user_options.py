@@ -31,6 +31,36 @@ class UserOptionTests(unittest.TestCase):
         self.assertEqual(required["output_language"][0], ["auto", "中文", "English"])
         self.assertEqual(required["transparent_rgba"][0], "BOOLEAN")
 
+    def test_edit_budget_schema_default_and_forwarding(self):
+        spec = QwenPERewrite.INPUT_TYPES()["optional"]["edit_max_tokens"]
+        self.assertEqual(spec[0], "INT")
+        self.assertEqual((spec[1]["default"], spec[1]["min"], spec[1]["max"]), (1536, 1, 65536))
+        for options, budget in (({}, 1536), ({"edit_max_tokens": 8192}, 8192)):
+            with self.subTest(options=options):
+                answer = {"rewritten_prompt": "Rebuild the selected fabric region.",
+                          "wh_ratio": "", "ratio_follow": ""}
+                info = {"finish_reason": "stop", "usage": {}, "max_tokens": budget}
+                with (patch.dict(sys.modules, {"comfy": None, "comfy.model_management": None}),
+                      patch("qwen_pe_test_package.pe_nodes.resolve_model", return_value=Path("edit.gguf")),
+                      patch("qwen_pe_test_package.pe_nodes.pick_mmproj", return_value=Path("vision.gguf")),
+                      patch("qwen_pe_test_package.pe_nodes.prepare_images", return_value=(["a"], [[64, 64]])),
+                      patch("qwen_pe_test_package.pe_nodes.SERVER.start"),
+                      patch("qwen_pe_test_package.pe_nodes.SERVER.complete", return_value=(answer, info)) as complete,
+                      patch("qwen_pe_test_package.pe_nodes.SERVER.stop")):
+                    _, result, _ = QwenPERewrite().rewrite("Rebuild the region", "auto", "auto", "auto", False,
+                        DEFAULT_T2I, "edit.gguf", "Auto", "after_run", 42, image_1="a", **options)
+                self.assertEqual(complete.call_args.kwargs["edit_max_tokens"], budget)
+                self.assertEqual((result["edit_max_tokens"], result["max_tokens"]), (budget, budget))
+
+    def test_invalid_edit_budget_does_not_load_a_model(self):
+        for budget in (0, -1, True, 1.5, "4096", 65537):
+            with self.subTest(budget=budget), patch("qwen_pe_test_package.pe_nodes.resolve_model") as resolve:
+                with self.assertRaisesRegex(ValueError, "edit_max_tokens"):
+                    QwenPERewrite().rewrite("Rebuild the region", "edit", "auto", "auto", False,
+                        DEFAULT_T2I, "edit.gguf", "Auto", "after_run", 42,
+                        image_1="a", edit_max_tokens=budget)
+                resolve.assert_not_called()
+
     def test_connected_none_ports_do_not_count_as_reference_images(self):
         for active_ports in ([1], [3], [1, 5], [1, 2, 3, 4, 6, 7, 8, 9, 10]):
             with self.subTest(active_ports=active_ports):
@@ -57,12 +87,53 @@ class UserOptionTests(unittest.TestCase):
                       patch("qwen_pe_test_package.pe_nodes.SERVER.stop")):
                     _, result, _ = QwenPERewrite().rewrite(
                         "Change the source image to blue.", "auto", "auto", "auto", False,
-                        DEFAULT_T2I, "edit.gguf", "Auto", "after_run", 42, **images)
+                        DEFAULT_T2I, "edit.gguf", "Auto", "after_run", 42,
+                        **({"reasoning": "off", "system_prompt": "External rewrite policy."}
+                           if len(active_ports) > 1 else {}), **images)
                 self.assertEqual(result["task"], "edit")
                 self.assertEqual(result["image_dimensions"], dimensions)
                 self.assertEqual(result["image_input_ports"],
                                  [f"image_{i}" for i in active_ports])
                 self.assertEqual(complete.call_args.args[2], encoded)
+                self.assertEqual(complete.call_args.kwargs["reasoning"],
+                                 "off" if len(active_ports) > 1 else "auto")
+                self.assertEqual(complete.call_args.kwargs["system_prompt"],
+                                 "External rewrite policy." if len(active_ports) > 1 else None)
+                self.assertEqual(result["system_prompt_source"],
+                                 "custom" if len(active_ports) > 1 else "default")
+
+    def test_edit_canvas_is_fixed_by_input_selection_not_model_ratio(self):
+        memory = types.ModuleType("comfy.model_management")
+        memory.intermediate_device = lambda: "cpu"
+        memory.free_memory = lambda *args: None
+        memory.get_torch_device = lambda: "cpu"
+        memory.soft_empty_cache = lambda: None
+        comfy = types.ModuleType("comfy")
+        comfy.model_management = memory
+        for selection, source, size in ((1, "<image1>", (768, 768)), (2, "<image2>", (1280, 640))):
+            with self.subTest(selection=selection):
+                answer = {"rewritten_prompt": "Blend <image1> into <image2>.",
+                          "wh_ratio": "9:16", "ratio_follow": "<image9>"}
+                with (patch.dict(sys.modules, {"comfy": comfy, "comfy.model_management": memory}),
+                      patch("qwen_pe_test_package.pe_nodes.resolve_model", return_value=Path("edit.gguf")),
+                      patch("qwen_pe_test_package.pe_nodes.pick_mmproj", return_value=Path("vision.gguf")),
+                      patch("qwen_pe_test_package.pe_nodes.prepare_images",
+                            return_value=(["a", "b"], [[768, 768], [1280, 640]])),
+                      patch("qwen_pe_test_package.pe_nodes.SERVER.start"),
+                      patch("qwen_pe_test_package.pe_nodes.SERVER.complete", return_value=(answer, {"finish_reason":"stop", "usage":{}})),
+                      patch("qwen_pe_test_package.pe_nodes.SERVER.stop")):
+                    _, result, _ = QwenPERewrite().rewrite("Blend the images", "edit", "16:9", "auto", False,
+                        DEFAULT_T2I, "edit.gguf", "Auto", "after_run", 42, canvas_image=selection,
+                        image_1="a", image_2="b")
+                    width, height, _, ratio_source = QwenPECanvas().canvas(result, 1024, True)
+                self.assertEqual((result["wh_ratio"], result["ratio_follow"]), ("", source))
+                self.assertEqual((width, height), size)
+                self.assertEqual(ratio_source, source)
+        with (patch("qwen_pe_test_package.pe_nodes.SERVER.start") as start,
+              self.assertRaisesRegex(ValueError, "available input image")):
+            QwenPERewrite().rewrite("Edit the image", "edit", "auto", "auto", False,
+                DEFAULT_T2I, "edit.gguf", "Auto", "after_run", 42, canvas_image=2, image_1="a")
+        start.assert_not_called()
 
     def test_transparent_prompt_uses_selected_language_and_ratio(self):
         chinese = _format_prompt("一只蝴蝶。", True, "zh")
